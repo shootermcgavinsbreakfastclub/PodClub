@@ -911,6 +911,990 @@
     const snap = await rosterDoc.get();
     const order = (snap.exists && snap.data().memberIds) ? snap.data().memberIds.slice() : [];
     for (const name of names) {
+      const ref = await db.collection("members").add({ name, addedAt: new Date().toISOString() });
+      order.push(ref.id);
+    }
+    if (snap.exists) await rosterDoc.update({ memberIds: order });
+    else await rosterDoc.set({ memberIds: order });
+    input.value = "";
+    toast(names.length > 1 ? `Added ${names.length} members to the roster` : "Added " + names[0] + " to the roster");
+  }
+
+  async function removeMember(id) {
+    if (!db || rosterBusy) return;
+    rosterBusy = true;
+    try {
+      const rosterDoc = db.doc("meta/roster");
+      const snap = await rosterDoc.get();
+      const oldOrder = (snap.exists && snap.data().memberIds) ? snap.data().memberIds : [];
+      const newOrder = oldOrder.filter(x => x !== id);
+      await rosterDoc.set({ memberIds: newOrder });
+      // If the removed member was on deck, hand the pointer to whoever
+      // was next after them in the old order.
+      if (state.currentMemberId === id && newOrder.length > 0) {
+        const oldIdx = oldOrder.indexOf(id);
+        let fallback = null;
+        for (let k = 1; k <= oldOrder.length; k++) {
+          const cand = oldOrder[(oldIdx + k) % oldOrder.length];
+          if (cand !== id && newOrder.includes(cand)) { fallback = cand; break; }
+        }
+        if (fallback) await db.doc("meta/rotation").set({ currentMemberId: fallback });
+      }
+    } finally {
+      rosterBusy = false;
+    }
+  }
+
+  async function moveMember(id, dir) {
+    if (!db || rosterBusy) return;
+    rosterBusy = true;
+    try {
+      const rosterDoc = db.doc("meta/roster");
+      const snap = await rosterDoc.get();
+      const order = (snap.exists && snap.data().memberIds) ? snap.data().memberIds.slice() : [];
+      const i = order.indexOf(id);
+      if (i === -1) return;
+      const j = dir === "up" ? i - 1 : i + 1;
+      if (j < 0 || j >= order.length) return;
+      [order[i], order[j]] = [order[j], order[i]];
+      await rosterDoc.set({ memberIds: order });
+      // Rotation pointer is stored as an id, so reordering never needs to
+      // touch it — whoever was on deck stays on deck.
+    } finally {
+      rosterBusy = false;
+    }
+  }
+
+  async function saveSession() {
+    if (!db) return;
+    const nominatorId = currentNominatorId();
+    if (!nominatorId) return;
+    if ($("#whoami-select").value !== nominatorId) { toast("Only the on-deck member can submit this month's picks"); return; }
+    const optionAName = $("#f-optA-name").value.trim();
+    const optionAUrl = $("#f-optA-url").value.trim();
+    const optionANote = $("#f-optA-note").value.trim();
+    const optionBName = $("#f-optB-name").value.trim();
+    const optionBUrl = $("#f-optB-url").value.trim();
+    const optionBNote = $("#f-optB-note").value.trim();
+    const date = $("#f-date").value;
+    const time = $("#f-time").value;
+    const venue = $("#f-venue").value.trim();
+    if (!optionAName || !optionBName) { toast("Add both podcast options first"); return; }
+    if (!optionANote || !optionBNote) { toast("Add a sentence on why for each option"); return; }
+    const payload = {
+      nominatorId, optionAName, optionAUrl, optionANote, optionBName, optionBUrl, optionBNote,
+      date, time, venue
+    };
+    const existing = findUpcomingSession();
+    if (existing) {
+      await db.doc("sessions/" + existing.id).update(payload);
+      state.editingSession = false;
+      toast("Details updated");
+    } else {
+      await db.collection("sessions").add(Object.assign({ status: "upcoming", createdAt: new Date().toISOString() }, payload));
+      toast("This month's picks are locked in");
+    }
+  }
+
+  async function submitRating(sessionId, formId) {
+    const myId = $("#whoami-select").value;
+    if (!myId || !db) return;
+    const data = {};
+    ["A", "B"].forEach(letter => {
+      ["content", "production", "comment"].forEach(key => {
+        const field = ratingField(letter, key);
+        const input = $("#rate-" + formId + "-" + field);
+        if (input) data[field] = (key === "comment") ? input.value.trim() : parseInt(input.value, 10);
+      });
+    });
+    data.ratedAt = new Date().toISOString();
+    await db.doc("sessions/" + sessionId).collection("ratings").doc(myId).set(data);
+    localStorage.setItem("podclub-whoami", myId);
+    // The live "upcoming" session refreshes via its onSnapshot listener;
+    // any other (history) session needs an explicit reload.
+    if (sessionId !== state._ratingsSubId) {
+      await loadRatingsFor(sessionId);
+      renderAll();
+    }
+    toast("Review saved");
+  }
+
+  async function logPastSession() {
+    if (!db) return;
+    const nominatorId = $("#bf-nominator").value;
+    const optionAName = $("#bf-optA-name").value.trim();
+    const optionAUrl = $("#bf-optA-url").value.trim();
+    const optionBName = $("#bf-optB-name").value.trim();
+    const optionBUrl = $("#bf-optB-url").value.trim();
+    const date = $("#bf-date").value;
+    const venue = $("#bf-venue").value.trim();
+    if (!nominatorId) { toast("Pick who nominated"); return; }
+    if (!optionAName || !optionBName) { toast("Add both podcast options"); return; }
+    await db.collection("sessions").add({
+      status: "reviewed", createdAt: new Date().toISOString(),
+      nominatorId, optionAName, optionAUrl, optionANote: "", optionBName, optionBUrl, optionBNote: "",
+      date, time: "", venue
+    });
+    state.showBackfill = false;
+    toast("Added to history");
+  }
+
+  async function markReviewed(sessionId) {
+    if (!db) return;
+    await db.doc("sessions/" + sessionId).update({ status: "reviewed" });
+    const rosterDoc = db.doc("meta/roster");
+    const snap = await rosterDoc.get();
+    const order = (snap.exists && snap.data().memberIds) ? snap.data().memberIds : [];
+    if (order.length === 0) { toast("Advanced"); return; }
+    const curId = (state.currentMemberId && order.includes(state.currentMemberId)) ? state.currentMemberId : order[0];
+    const idx = order.indexOf(curId);
+    const nextId = order[(idx + 1) % order.length];
+    await db.doc("meta/rotation").set({ currentMemberId: nextId });
+    state.sessionTab = "review";
+    toast("Advanced to the next member");
+  }
+
+  async function loadRatingsFor(sessionId) {
+    if (!db) return;
+    const snap = await db.doc("sessions/" + sessionId).collection("ratings").get();
+    const map = {};
+    snap.docs.forEach(d => { map[d.id] = d.data(); });
+    state.ratingsCache[sessionId] = map;
+  }
+
+  // ---------- Wiring ----------
+
+  $("#add-member-btn").onclick = addMember;
+  $("#new-member-name").addEventListener("keydown", e => { if (e.key === "Enter") addMember(); });
+  $("#whoami-select").addEventListener("change", () => {
+    localStorage.setItem("podclub-whoami", $("#whoami-select").value);
+    renderAll();
+  });
+  $("#history-filter").addEventListener("change", renderHistory);
+  $("#toggle-backfill-btn").onclick = () => { state.showBackfill = !state.showBackfill; renderBackfill(); };
+
+  // ---------- Supabase-backed storage shim ----------
+  // Mimics the same collection/doc/onSnapshot interface the rest of this
+  // app was written against, so nothing above this line needs to change.
+
+  const SUPABASE_URL = "https://grvanyqcxnlqegnzidjd.supabase.co";
+  const SUPABASE_KEY = "sb_publishable_scmLqkA1PbMFxMuokNlSnA_mz8JGGc7";
+
+  function toCamel(row) {
+    if (!row) return row;
+    const out = {};
+    Object.keys(row).forEach(k => {
+      const camel = k.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+      out[camel] = row[k];
+    });
+    return out;
+  }
+  function toSnake(obj) {
+    const out = {};
+    Object.keys(obj).forEach(k => {
+      const snake = k.replace(/[A-Z]/g, c => "_" + c.toLowerCase());
+      out[snake] = obj[k];
+    });
+    return out;
+  }
+  function docSnap(row) {
+    return { exists: !!row, data: () => row ? toCamel(row) : undefined };
+  }
+
+  function makeDb(sb) {
+    function subscribeTable(table, matchCol, matchVal, onChange) {
+      const channel = sb.channel(table + "-" + (matchVal || "all") + "-" + Math.random().toString(36).slice(2))
+        .on("postgres_changes", { event: "*", schema: "public", table }, onChange)
+        .subscribe();
+      return () => sb.removeChannel(channel);
+    }
+
+    return {
+      collection(name) {
+        if (name === "members") {
+          return {
+            async add(data) {
+              const { data: row, error } = await sb.from("members").insert(toSnake(data)).select().single();
+              if (error) throw error;
+              return { id: row.id };
+            },
+            onSnapshot(cb, onErr) {
+              const fetchAndEmit = async () => {
+                const { data, error } = await sb.from("members").select("*");
+                if (error) { if (onErr) onErr(error); return; }
+                cb({ docs: data.map(row => ({ id: row.id, data: () => toCamel(row) })) });
+              };
+              fetchAndEmit();
+              return subscribeTable("members", null, null, fetchAndEmit);
+            }
+          };
+        }
+        if (name === "sessions") {
+          return {
+            async add(data) {
+              const { data: row, error } = await sb.from("sessions").insert(toSnake(data)).select().single();
+              if (error) throw error;
+              return { id: row.id };
+            },
+            orderBy(_col, _dir) {
+              return {
+                limit(n) {
+                  return {
+                    onSnapshot(cb, onErr) {
+                      const fetchAndEmit = async () => {
+                        const { data, error } = await sb.from("sessions").select("*").order("created_at", { ascending: false }).limit(n);
+                        if (error) { if (onErr) onErr(error); return; }
+                        cb({ docs: data.map(row => ({ id: row.id, data: () => toCamel(row) })) });
+                      };
+                      fetchAndEmit();
+                      return subscribeTable("sessions", null, null, fetchAndEmit);
+                    }
+                  };
+                }
+              };
+            }
+          };
+        }
+        throw new Error("Unknown collection: " + name);
+      },
+
+      doc(path) {
+        if (path === "meta/roster" || path === "meta/rotation") {
+          const field = path === "meta/roster" ? "member_ids" : "current_member_id";
+          return {
+            async get() {
+              const { data, error } = await sb.from("club_state").select("*").eq("id", "singleton").maybeSingle();
+              if (error) throw error;
+              return docSnap(data);
+            },
+            async set(data) {
+              const payload = toSnake(data);
+              const { error } = await sb.from("club_state").update(payload).eq("id", "singleton");
+              if (error) throw error;
+            },
+            async update(data) {
+              return this.set(data);
+            },
+            onSnapshot(cb, onErr) {
+              const fetchAndEmit = async () => {
+                const { data, error } = await sb.from("club_state").select("*").eq("id", "singleton").maybeSingle();
+                if (error) { if (onErr) onErr(error); return; }
+                cb(docSnap(data));
+              };
+              fetchAndEmit();
+              return subscribeTable("club_state", null, null, fetchAndEmit);
+            }
+          };
+        }
+        if (path.startsWith("sessions/")) {
+          const sessionId = path.slice("sessions/".length);
+          return {
+            async update(data) {
+              const { error } = await sb.from("sessions").update(toSnake(data)).eq("id", sessionId);
+              if (error) throw error;
+            },
+            collection(sub) {
+              if (sub !== "ratings") throw new Error("Unknown subcollection: " + sub);
+              return {
+                doc(memberId) {
+                  return {
+                    async set(data) {
+                      const payload = Object.assign({ session_id: sessionId, member_id: memberId }, toSnake(data));
+                      const { error } = await sb.from("ratings").upsert(payload, { onConflict: "session_id,member_id" });
+                      if (error) throw error;
+                    }
+                  };
+                },
+                async get() {
+                  const { data, error } = await sb.from("ratings").select("*").eq("session_id", sessionId);
+                  if (error) throw error;
+                  return { docs: data.map(row => ({ id: row.member_id, data: () => toCamel(row) })) };
+                },
+                onSnapshot(cb, onErr) {
+                  const fetchAndEmit = async () => {
+                    const { data, error } = await sb.from("ratings").select("*").eq("session_id", sessionId);
+                    if (error) { if (onErr) onErr(error); return; }
+                    cb({ docs: data.map(row => ({ id: row.member_id, data: () => toCamel(row) })) });
+                  };
+                  fetchAndEmit();
+                  return subscribeTable("ratings", "session_id", sessionId, fetchAndEmit);
+                }
+              };
+            }
+          };
+        }
+        throw new Error("Unknown doc path: " + path);
+      }
+    };
+  }
+
+  async function init() {
+    if (!window.supabase) {
+      $("#db-banner").innerHTML = `<div class="banner">Couldn't load the database library — check your internet connection and reload.</div>`;
+      renderAll();
+      return;
+    }
+    const sb = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+    db = makeDb(sb);
+
+    db.collection("members").onSnapshot(snap => {
+      const map = {};
+      snap.docs.forEach(d => { map[d.id] = d.data(); });
+      state.members = map;
+      renderAll();
+    }, err => console.error("members", err));
+
+    db.doc("meta/roster").onSnapshot(snap => {
+      state.rosterOrder = (snap.exists && snap.data().memberIds) ? snap.data().memberIds : [];
+      renderAll();
+    }, err => console.error("roster", err));
+
+    db.doc("meta/rotation").onSnapshot(snap => {
+      state.currentMemberId = (snap.exists && snap.data().currentMemberId) ? snap.data().currentMemberId : null;
+      renderAll();
+    }, err => console.error("rotation", err));
+
+    db.collection("sessions").orderBy("createdAt", "desc").limit(200).onSnapshot(snap => {
+      state.sessions = snap.docs.map(d => Object.assign({ id: d.id }, d.data()));
+      const upcoming = findUpcomingSession();
+      const upcomingId = upcoming ? upcoming.id : null;
+      if (upcomingId !== state._ratingsSubId) {
+        if (state._ratingsUnsub) { state._ratingsUnsub(); state._ratingsUnsub = null; }
+        state._ratingsSubId = upcomingId;
+        if (upcomingId) {
+          state._ratingsUnsub = db.doc("sessions/" + upcomingId).collection("ratings").onSnapshot(rsnap => {
+            const map = {};
+            rsnap.docs.forEach(d => { map[d.id] = d.data(); });
+            state.ratingsCache[upcomingId] = map;
+            renderAll();
+          }, err => console.error("ratings", err));
+        }
+      }
+      renderAll();
+    }, err => console.error("sessions", err));
+
+    renderAll();
+  }
+
+  init();
+})();
+</script>
+</body>
+</html>
+
+
+  const MONTH_ABBR = ["JAN","FEB","MAR","APR","MAY","JUN","JUL","AUG","SEP","OCT","NOV","DEC"];
+
+  // The on-deck member's meeting is one month after the most recent
+  // reviewed meetup (or one month after today, if there's no history yet).
+  function anchorMonthDate() {
+    const reviewed = reviewedSessions();
+    let base;
+    if (reviewed.length > 0 && reviewed[0].date) {
+      base = new Date(reviewed[0].date + "T00:00:00");
+    } else {
+      base = new Date();
+    }
+    base.setDate(1);
+    base.setMonth(base.getMonth() + 1);
+    return base;
+  }
+
+  function monthAbbrAt(anchor, offset) {
+    const d = new Date(anchor.getFullYear(), anchor.getMonth() + offset, 1);
+    return MONTH_ABBR[d.getMonth()];
+  }
+
+  // Reviews for a session stay open through the end of the calendar month
+  // its meetup falls in. No date set yet → no deadline (always open).
+  function reviewDeadline(s) {
+    if (!s.date) return null;
+    const d = new Date(s.date + "T00:00:00");
+    if (isNaN(d.getTime())) return null;
+    return new Date(d.getFullYear(), d.getMonth() + 1, 0, 23, 59, 59);
+  }
+
+  function isReviewOpen(s) {
+    const deadline = reviewDeadline(s);
+    return !deadline || Date.now() <= deadline.getTime();
+  }
+
+  function formatDeadline(d) {
+    const m = MONTH_ABBR[d.getMonth()];
+    return `${d.getDate()} ${m.charAt(0)}${m.slice(1).toLowerCase()} ${d.getFullYear()}`;
+  }
+
+  // ---------- Rendering ----------
+
+  function renderWhoAmI() {
+    const sel = $("#whoami-select");
+    const prev = sel.value;
+    const roster = activeRoster();
+    sel.innerHTML = '<option value="">— select —</option>' + roster.map(id =>
+      `<option value="${id}">${escapeHtml(state.members[id].name)}</option>`).join("");
+    if (roster.includes(prev)) sel.value = prev;
+    else if (localStorage.getItem("podclub-whoami") && roster.includes(localStorage.getItem("podclub-whoami"))) {
+      sel.value = localStorage.getItem("podclub-whoami");
+    }
+  }
+
+  function renderCarousel() {
+    const roster = activeRoster();
+    const holder = $("#carousel-holder");
+    const currentId = currentNominatorId();
+    const nextId = nextNominatorId();
+    if (roster.length === 0) {
+      holder.innerHTML = `<p class="empty-note">No members yet.</p>`;
+      return;
+    }
+    const n = roster.length;
+    const c = roster.indexOf(currentId);
+    const lastId = roster[((c - 1) % n + n) % n];
+    const anchor = anchorMonthDate();
+    // One full lap: last (offset -1), current (0), next, next2, ... up to
+    // whoever is two-before current — i.e. everyone exactly once, ending
+    // right before "last" would come up again.
+    const cards = [];
+    for (let offset = -1; offset < n - 1; offset++) {
+      const idx = ((c + offset) % n + n) % n;
+      const id = roster[idx];
+      const cls = id === currentId ? "current" : (id === nextId ? "next" : "");
+      const clickable = (id === currentId || id === lastId) ? " cc-clickable" : " cc-static";
+      cards.push({ id, cls: cls + clickable, month: monthAbbrAt(anchor, offset) });
+    }
+    holder.innerHTML = `<div class="carousel" id="carousel-track">` +
+      cards.map(c2 => `<div class="carousel-card ${c2.cls}" data-member="${c2.id}">${escapeHtml(state.members[c2.id].name)}<span class="cc-month">${c2.month}</span></div>`).join("") +
+      `</div>`;
+    holder.querySelectorAll(".carousel-card").forEach(card => {
+      const memberId = card.dataset.member;
+      card.onclick = () => {
+        if (memberId === currentId) {
+          // On deck — take them to the live nomination area.
+          state.sessionTab = "nominate";
+          renderSession();
+          const target = $("#section-session");
+          if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        } else if (memberId === lastId) {
+          // Just had their turn — most likely reason to tap them is to log
+          // that meetup, so open the backfill form pre-filled with their name.
+          state.showBackfill = true;
+          renderBackfill();
+          const sel = $("#bf-nominator");
+          if (sel) sel.value = memberId;
+          const target = $("#section-history");
+          if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+        }
+        // Anyone further out doesn't have anything to show yet — no-op.
+      };
+    });
+    if (state._lastCenteredId !== currentId) {
+      state._lastCenteredId = currentId;
+      const track = $("#carousel-track");
+      const card = track && track.querySelector(`[data-member="${currentId}"]`);
+      if (card) card.scrollIntoView({ inline: "center", block: "nearest" });
+    }
+  }
+
+  function renderUpNext() {
+    const el = $("#up-next-card");
+    const currentId = currentNominatorId();
+    const nextId = nextNominatorId();
+    const upcoming = findUpcomingSession();
+    if (!currentId) {
+      el.innerHTML = `<p class="up-next-label">Nobody on the roster yet</p><p class="empty-note">Add a few members below to start the rotation.</p>`;
+      return;
+    }
+    const name = state.members[currentId].name;
+    const nextLine = nextId ? `<p class="up-next-next">Next: <strong>${escapeHtml(state.members[nextId].name)}</strong></p>` : "";
+    if (upcoming) {
+      const bothNames = [upcoming.optionAName, upcoming.optionBName].filter(Boolean).join(" & ");
+      el.innerHTML = `
+        <p class="up-next-label">On deck</p>
+        <p class="up-next-name">${escapeHtml(name)}</p>
+        <p class="up-next-meta">${escapeHtml(bothNames || "Picks TBC")}${upcoming.date ? " · " + escapeHtml(upcoming.date) : ""}${upcoming.venue ? " · " + escapeHtml(upcoming.venue) : ""}</p>
+        ${nextLine}`;
+    } else {
+      el.innerHTML = `
+        <p class="up-next-label">On deck</p>
+        <p class="up-next-name">${escapeHtml(name)}</p>
+        <p class="up-next-meta">Hasn't locked in picks yet — see below.</p>
+        ${nextLine}`;
+    }
+  }
+
+  function nominationFormHtml(s, nominatorName) {
+    s = s || {};
+    const editingExisting = !!(s && s.optionAName);
+    return `
+      <p style="margin-top:0;color:var(--ink-dim);font-size:0.9rem;">It's <strong style="color:var(--ink);">${escapeHtml(nominatorName)}</strong>'s turn to pick — bring two options for the group to review:</p>
+      <label class="field-label">Option A</label>
+      <input type="text" id="f-optA-name" placeholder="Podcast + episode" value="${escapeHtml(s.optionAName || "")}">
+      <input type="url" id="f-optA-url" placeholder="Link (optional)" style="margin-top:6px;" value="${escapeHtml(s.optionAUrl || "")}">
+      <input type="text" id="f-optA-note" placeholder="One sentence on why this one" style="margin-top:6px;" value="${escapeHtml(s.optionANote || "")}">
+      <label class="field-label">Option B</label>
+      <input type="text" id="f-optB-name" placeholder="Podcast + episode" value="${escapeHtml(s.optionBName || "")}">
+      <input type="url" id="f-optB-url" placeholder="Link (optional)" style="margin-top:6px;" value="${escapeHtml(s.optionBUrl || "")}">
+      <input type="text" id="f-optB-note" placeholder="One sentence on why this one" style="margin-top:6px;" value="${escapeHtml(s.optionBNote || "")}">
+      <div class="row">
+        <div><label class="field-label">Date</label><input type="date" id="f-date" value="${escapeHtml(s.date || "")}"></div>
+        <div><label class="field-label">Time</label><input type="time" id="f-time" value="${escapeHtml(s.time || "")}"></div>
+      </div>
+      <label class="field-label">Venue</label>
+      <input type="text" id="f-venue" placeholder="e.g. Dave's place, or The Empire Hotel" value="${escapeHtml(s.venue || "")}">
+      <button class="btn" id="save-session-btn">${editingExisting ? "Save changes" : "Lock in this month's picks"}</button>
+      ${editingExisting ? `<button class="btn secondary" id="cancel-edit-btn">Cancel</button>` : ""}
+    `;
+  }
+
+  function wireNominationForm() {
+    $("#save-session-btn").onclick = saveSession;
+    const cancelBtn = $("#cancel-edit-btn");
+    if (cancelBtn) cancelBtn.onclick = () => { state.editingSession = false; renderSession(); };
+  }
+
+  function nominationReadHtml(s, nominatorName, canEdit) {
+    return `
+      <div class="pick-options">
+        <div class="pick-pill">
+          <span class="pill-tag">Option A</span>
+          <strong>${escapeHtml(s.optionAName || "Untitled")}</strong>
+          ${s.optionAUrl ? ` — <a href="${escapeHtml(s.optionAUrl)}" target="_blank" rel="noopener" style="color:var(--teal);">listen</a>` : ""}
+          ${s.optionANote ? `<div style="margin-top:6px;font-style:italic;color:var(--ink-dim);">“${escapeHtml(s.optionANote)}”</div>` : ""}
+        </div>
+        <div class="pick-pill">
+          <span class="pill-tag">Option B</span>
+          <strong>${escapeHtml(s.optionBName || "Untitled")}</strong>
+          ${s.optionBUrl ? ` — <a href="${escapeHtml(s.optionBUrl)}" target="_blank" rel="noopener" style="color:var(--teal);">listen</a>` : ""}
+          ${s.optionBNote ? `<div style="margin-top:6px;font-style:italic;color:var(--ink-dim);">“${escapeHtml(s.optionBNote)}”</div>` : ""}
+        </div>
+      </div>
+      <p style="color:var(--ink-dim);font-size:0.88rem;">
+        Nominated by ${escapeHtml(nominatorName)}${s.date ? " · " + escapeHtml(s.date) : ""}${s.time ? " " + escapeHtml(s.time) : ""}${s.venue ? " · " + escapeHtml(s.venue) : ""}
+        ${canEdit ? `<button class="icon-btn" id="edit-session-btn" style="margin-left:6px;text-decoration:underline;">edit</button>` : ""}
+      </p>
+    `;
+  }
+
+  function reviewFormHtml(s, formId, opts) {
+    opts = opts || {};
+    const roster = activeRoster();
+    const myId = $("#whoami-select").value;
+    const cache = state.ratingsCache[s.id] || {};
+    const ratedCount = Object.keys(cache).length;
+    const mine = myId ? (cache[myId] || {}) : {};
+    const deadline = reviewDeadline(s);
+    const open = isReviewOpen(s);
+    const deadlineLine = deadline
+      ? `<p style="font-size:0.78rem;color:${open ? "var(--ink-faint)" : "var(--danger)"};margin:2px 0 12px;">${open ? "Reviews close " + formatDeadline(deadline) : "Reviews closed " + formatDeadline(deadline)}</p>`
+      : "";
+
+    function podBlock(letter, name) {
+      if (!name) return "";
+      const cKey = ratingField(letter, "content");
+      const pKey = ratingField(letter, "production");
+      const noteKey = ratingField(letter, "comment");
+      return `
+        <div class="pod-review-block">
+          <h4>${letter}: ${escapeHtml(name)}</h4>
+          <div class="criterion">
+            <div class="criterion-head"><span>Content</span><span class="val" id="val-${formId}-${cKey}">${mine[cKey] || 3}</span></div>
+            <input type="range" min="1" max="5" step="1" value="${mine[cKey] || 3}" id="rate-${formId}-${cKey}">
+          </div>
+          <div class="criterion">
+            <div class="criterion-head"><span>Production quality</span><span class="val" id="val-${formId}-${pKey}">${mine[pKey] || 3}</span></div>
+            <input type="range" min="1" max="5" step="1" value="${mine[pKey] || 3}" id="rate-${formId}-${pKey}">
+          </div>
+          <label class="field-label">Your take on this one (optional)</label>
+          <textarea id="rate-${formId}-${noteKey}">${escapeHtml(mine[noteKey] || "")}</textarea>
+        </div>`;
+    }
+
+    if (!open) {
+      return `
+        <p style="margin-top:0;font-size:0.85rem;color:var(--ink-dim);">The review window for this one has closed.</p>
+        ${deadlineLine}
+        <p style="font-size:0.8rem;color:var(--ink-faint);">${ratedCount} of ${roster.length} club members reviewed this one.</p>
+        ${opts.hideMarkReviewed ? "" : `<button class="btn ${state.confirmingReview ? "danger" : "secondary"} small" id="mark-reviewed-btn" style="margin-top:6px;">${state.confirmingReview ? "Click again to confirm" : "Mark reviewed & advance rotation"}</button>`}
+      `;
+    }
+
+    return `
+      <p style="margin-top:0;font-size:0.85rem;color:var(--ink-dim);">Listen to both, then rate each on content and production quality.</p>
+      ${deadlineLine}
+      ${myId ? `
+        ${podBlock("A", s.optionAName)}
+        ${podBlock("B", s.optionBName)}
+        <button class="btn" id="submit-rating-${formId}-btn">${cache[myId] ? "Update my review" : "Submit my review"}</button>
+      ` : `<p class="empty-note">Pick who you are up top to review this month's picks.</p>`}
+      <p style="font-size:0.8rem;color:var(--ink-faint);margin-top:14px;">${ratedCount} of ${roster.length} club members have reviewed so far.</p>
+      ${opts.hideMarkReviewed ? "" : `<button class="btn ${state.confirmingReview ? "danger" : "secondary"} small" id="mark-reviewed-btn" style="margin-top:6px;">${state.confirmingReview ? "Click again to confirm" : "Mark reviewed & advance rotation"}</button>`}
+    `;
+  }
+
+  function wireReviewForm(s, formId, opts) {
+    opts = opts || {};
+    const myId = $("#whoami-select").value;
+    if (myId) {
+      ["A","B"].forEach(letter => {
+        ["content","production"].forEach(key => {
+          const field = ratingField(letter, key);
+          const input = $("#rate-" + formId + "-" + field);
+          if (input) input.oninput = () => { $("#val-" + formId + "-" + field).textContent = input.value; };
+        });
+      });
+      const submitBtn = $("#submit-rating-" + formId + "-btn");
+      if (submitBtn) submitBtn.onclick = () => submitRating(s.id, formId);
+    }
+    if (!opts.hideMarkReviewed) {
+      $("#mark-reviewed-btn").onclick = () => {
+        if (state.confirmingReview) {
+          state.confirmingReview = false;
+          markReviewed(s.id);
+        } else {
+          state.confirmingReview = true;
+          renderSession();
+          setTimeout(() => { if (state.confirmingReview) { state.confirmingReview = false; renderSession(); } }, 4000);
+        }
+      };
+    }
+  }
+
+  function renderSession() {
+    const holder = $("#session-holder");
+    const currentId = currentNominatorId();
+    const upcoming = findUpcomingSession();
+    if (!currentId) {
+      holder.innerHTML = `<p class="empty-note">Build the roster first.</p>`;
+      return;
+    }
+    const nominatorName = state.members[currentId].name;
+    const hasUpcoming = !!upcoming;
+    const tab = hasUpcoming ? (state.sessionTab || "review") : "nominate";
+    const myId = $("#whoami-select").value;
+    const isNominator = !!myId && myId === currentId;
+    if (state.editingSession && !isNominator) state.editingSession = false;
+
+    const tabBarHtml = `
+      <div class="tab-bar">
+        <button class="tab-btn ${tab === "review" ? "active" : ""}" data-tab="review" ${hasUpcoming ? "" : "disabled"}>Review</button>
+        <button class="tab-btn ${tab === "nominate" ? "active" : ""}" data-tab="nominate">Nomination</button>
+      </div>`;
+
+    let bodyHtml;
+    if (tab === "nominate") {
+      if (state.editingSession || !hasUpcoming) {
+        bodyHtml = isNominator
+          ? nominationFormHtml(upcoming, nominatorName)
+          : `<p class="empty-note">Only ${escapeHtml(nominatorName)} can submit this month's picks. Select their name above if that's you.</p>`;
+      } else {
+        bodyHtml = nominationReadHtml(upcoming, nominatorName, isNominator);
+      }
+    } else {
+      bodyHtml = `<p class="empty-note">Once ${escapeHtml(nominatorName)} locks in this month's picks, reviews open up here.</p>`;
+      if (hasUpcoming) bodyHtml = reviewFormHtml(upcoming, "live");
+    }
+
+    holder.innerHTML = tabBarHtml + bodyHtml;
+
+    holder.querySelectorAll("[data-tab]").forEach(btn => {
+      if (btn.disabled) return;
+      btn.onclick = () => { state.sessionTab = btn.dataset.tab; state.editingSession = false; renderSession(); };
+    });
+
+    if (tab === "nominate") {
+      if (state.editingSession || !hasUpcoming) {
+        if (isNominator) wireNominationForm();
+      } else if (isNominator) {
+        $("#edit-session-btn").onclick = () => { state.editingSession = true; renderSession(); };
+      }
+    } else if (hasUpcoming) {
+      wireReviewForm(upcoming, "live");
+    }
+  }
+
+  function renderRoster() {
+    const list = $("#roster-list");
+    const roster = activeRoster();
+    const currentId = currentNominatorId();
+    const nextId = nextNominatorId();
+    if (roster.length === 0) {
+      list.innerHTML = `<li class="empty-note">No members yet.</li>`;
+      return;
+    }
+    const n = roster.length;
+    const c = roster.indexOf(currentId);
+    const lastId = n > 1 ? roster[((c - 1) % n + n) % n] : null;
+    list.innerHTML = roster.map((id, i) => {
+      const badge = id === lastId ? `<span class="roster-badge last">last</span>`
+        : id === currentId ? `<span class="roster-badge current">on deck</span>`
+        : id === nextId ? `<span class="roster-badge next">next</span>` : "";
+      const actions = (state.confirmingRemove === id)
+        ? `<span class="roster-actions">
+             <button class="icon-btn confirming" data-confirm-remove="${id}">Remove?</button>
+             <button class="icon-btn" data-cancel-remove="${id}">Cancel</button>
+           </span>`
+        : `<span class="roster-actions">
+             <button class="icon-btn" data-move="up" data-id="${id}" title="Move up">↑</button>
+             <button class="icon-btn" data-move="down" data-id="${id}" title="Move down">↓</button>
+             <button class="icon-btn" data-remove="${id}" title="Remove">✕</button>
+           </span>`;
+      return `<li>
+        <span class="roster-order">${i + 1}</span>
+        <span>${escapeHtml(state.members[id].name)}</span>
+        ${badge}
+        ${actions}
+      </li>`;
+    }).join("");
+    list.querySelectorAll("[data-remove]").forEach(btn => {
+      btn.onclick = () => { state.confirmingRemove = btn.dataset.remove; renderRoster(); };
+    });
+    list.querySelectorAll("[data-cancel-remove]").forEach(btn => {
+      btn.onclick = () => { state.confirmingRemove = null; renderRoster(); };
+    });
+    list.querySelectorAll("[data-confirm-remove]").forEach(btn => {
+      btn.onclick = () => { state.confirmingRemove = null; removeMember(btn.dataset.confirmRemove); };
+    });
+    list.querySelectorAll("[data-move]").forEach(btn => {
+      btn.onclick = () => moveMember(btn.dataset.id, btn.dataset.move);
+    });
+  }
+
+  function renderHistoryFilter() {
+    const sel = $("#history-filter");
+    const prev = sel.value;
+    const roster = activeRoster();
+    sel.innerHTML = '<option value="">Everyone</option>' + roster.map(id =>
+      `<option value="${id}">${escapeHtml(state.members[id].name)}</option>`).join("");
+    sel.value = roster.includes(prev) ? prev : "";
+  }
+
+  function podAverages(cache, raterIds, letter) {
+    const cField = ratingField(letter, "content"), pField = ratingField(letter, "production");
+    const avg = arr => arr.length ? (arr.reduce((a,b) => a+b, 0) / arr.length) : 0;
+    const cAvg = avg(raterIds.map(rid => cache[rid][cField]).filter(v => typeof v === "number"));
+    const pAvg = avg(raterIds.map(rid => cache[rid][pField]).filter(v => typeof v === "number"));
+    const both = raterIds.flatMap(rid => [cache[rid][cField], cache[rid][pField]]).filter(v => typeof v === "number");
+    const overall = both.length ? both.reduce((a,b) => a+b, 0) / both.length : 0;
+    return { cAvg, pAvg, overall };
+  }
+
+  function starString(value) {
+    const rounded = Math.max(0, Math.min(5, Math.round(value)));
+    return "★".repeat(rounded) + "☆".repeat(5 - rounded);
+  }
+
+  function podBars(cache, raterIds, letter, name) {
+    if (!name) return "";
+    const { cAvg, pAvg } = podAverages(cache, raterIds, letter);
+    return `
+      <div style="margin-top:10px;">
+        <div class="bar-row"><span class="bar-label">Content</span><span class="bar-track"><span class="bar-fill" style="width:${(cAvg/5*100).toFixed(0)}%;"></span></span><span class="bar-num">${cAvg ? cAvg.toFixed(1) : "—"}</span></div>
+        <div class="bar-row"><span class="bar-label">Production</span><span class="bar-track"><span class="bar-fill" style="width:${(pAvg/5*100).toFixed(0)}%;"></span></span><span class="bar-num">${pAvg ? pAvg.toFixed(1) : "—"}</span></div>
+      </div>`;
+  }
+
+  function renderHistory() {
+    const holder = $("#history-holder");
+    const filterId = $("#history-filter").value;
+    let sessions = reviewedSessions();
+    if (filterId) {
+      sessions = sessions.filter(s => {
+        if (s.nominatorId === filterId) return true;
+        const cache = state.ratingsCache[s.id];
+        return cache && cache[filterId];
+      });
+    }
+    if (sessions.length === 0) {
+      holder.innerHTML = `<p class="empty-note">No reviewed sessions yet.</p>`;
+      return;
+    }
+
+    function podTile(s, letter, nomName, cache, raterIds) {
+      const name = s["option" + letter + "Name"];
+      if (!name) return "";
+      const note = s["option" + letter + "Note"];
+      const key = s.id + ":" + letter;
+      const isOpen = !!state.openHistory[key];
+      const { cAvg, pAvg, overall } = podAverages(cache, raterIds, letter);
+      const stars = raterIds.length > 0 ? starString(overall) : "☆☆☆☆☆";
+
+      let detailHtml = "";
+      if (isOpen) {
+        const barsHtml = raterIds.length > 0
+          ? podBars(cache, raterIds, letter, name)
+          : `<p class="empty-note" style="margin:10px 0 0;">No reviews submitted.</p>`;
+        let ratersHtml = "";
+        if (raterIds.length > 0) {
+          ratersHtml = `<div class="rater-list">` + raterIds.map(rid => {
+            const rname = (state.members[rid] || {}).name || "Former member";
+            const r = cache[rid];
+            const c = r[ratingField(letter, "content")], p = r[ratingField(letter, "production")], cm = r[ratingField(letter, "comment")];
+            return `<div><strong>${escapeHtml(rname)}</strong>: content ${c ?? "—"}, prod ${p ?? "—"}${cm ? " — “" + escapeHtml(cm) + "”" : ""}</div>`;
+          }).join("") + `</div>`;
+        }
+        detailHtml = `
+          ${note ? `<div class="rationale-quote">“${escapeHtml(note)}”</div>` : ""}
+          <div class="bars">${barsHtml}</div>
+          ${ratersHtml}
+        `;
+      }
+
+      return `<div class="history-item">
+        <div class="history-head" data-toggle="${key}">
+          <div>
+            <div class="hh-title">${escapeHtml(name)}</div>
+            <div class="pod-tile-stars">${stars}</div>
+            <div class="hh-meta">Nominated by ${escapeHtml(nomName)}${s.date ? " · " + escapeHtml(s.date) : ""}${s.venue ? " · " + escapeHtml(s.venue) : ""}</div>
+          </div>
+          <span style="color:var(--ink-faint);">${isOpen ? "▲" : "▼"}</span>
+        </div>
+        <div class="history-body ${isOpen ? "open" : ""}">${detailHtml}</div>
+      </div>`;
+    }
+
+    holder.innerHTML = sessions.map(s => {
+      const nomName = (state.members[s.nominatorId] || {}).name || "Unknown";
+      const cache = state.ratingsCache[s.id] || {};
+      const raterIds = Object.keys(cache);
+      return `
+        ${podTile(s, "A", nomName, cache, raterIds)}
+        ${podTile(s, "B", nomName, cache, raterIds)}
+        <div class="session-actions">
+          ${(s.optionAName || s.optionBName) ? `<button class="icon-btn" data-toggle-review="${s.id}" style="text-decoration:underline;">${state.historyReviewOpen[s.id] ? "Hide review form" : "Add / update your review"}</button>` : ""}
+          <button class="icon-btn" data-edit-history="${s.id}" style="text-decoration:underline;margin-left:12px;">${state.historyEditOpen[s.id] ? "Cancel edit" : "Edit details"}</button>
+        </div>
+        ${state.historyReviewOpen[s.id] ? `<div style="margin-bottom:16px;">${reviewFormHtml(s, s.id, { hideMarkReviewed: true })}</div>` : ""}
+        ${state.historyEditOpen[s.id] ? historyEditFormHtml(s) : ""}
+      `;
+    }).join("");
+
+    holder.querySelectorAll("[data-toggle]").forEach(el => {
+      el.onclick = () => {
+        const key = el.dataset.toggle;
+        const sessionId = key.split(":")[0];
+        state.openHistory[key] = !state.openHistory[key];
+        if (state.openHistory[key] && !state.ratingsCache[sessionId]) {
+          loadRatingsFor(sessionId).then(renderHistory);
+        } else {
+          renderHistory();
+        }
+      };
+    });
+    holder.querySelectorAll("[data-toggle-review]").forEach(el => {
+      el.onclick = () => {
+        const id = el.dataset.toggleReview;
+        state.historyReviewOpen[id] = !state.historyReviewOpen[id];
+        renderHistory();
+      };
+    });
+    holder.querySelectorAll("[data-edit-history]").forEach(el => {
+      el.onclick = () => {
+        const id = el.dataset.editHistory;
+        state.historyEditOpen[id] = !state.historyEditOpen[id];
+        renderHistory();
+      };
+    });
+    sessions.forEach(s => {
+      if (state.historyReviewOpen[s.id]) wireReviewForm(s, s.id, { hideMarkReviewed: true });
+      if (state.historyEditOpen[s.id]) {
+        $("#he-save-" + s.id).onclick = () => saveHistoryEdit(s.id);
+        $("#he-cancel-" + s.id).onclick = () => { state.historyEditOpen[s.id] = false; renderHistory(); };
+      }
+    });
+  }
+
+  function historyEditFormHtml(s) {
+    const roster = activeRoster();
+    return `
+      <div class="card" style="margin-top:14px;">
+        <label class="field-label">Nominator</label>
+        <select class="input" id="he-nominator-${s.id}">
+          ${roster.map(id => `<option value="${id}" ${id === s.nominatorId ? "selected" : ""}>${escapeHtml(state.members[id].name)}</option>`).join("")}
+        </select>
+        <label class="field-label">Option A</label>
+        <input type="text" id="he-optA-name-${s.id}" value="${escapeHtml(s.optionAName || "")}">
+        <input type="url" id="he-optA-url-${s.id}" placeholder="Link (optional)" style="margin-top:6px;" value="${escapeHtml(s.optionAUrl || "")}">
+        <label class="field-label">Option B</label>
+        <input type="text" id="he-optB-name-${s.id}" value="${escapeHtml(s.optionBName || "")}">
+        <input type="url" id="he-optB-url-${s.id}" placeholder="Link (optional)" style="margin-top:6px;" value="${escapeHtml(s.optionBUrl || "")}">
+        <div class="row">
+          <div><label class="field-label">Date</label><input type="date" id="he-date-${s.id}" value="${escapeHtml(s.date || "")}"></div>
+          <div><label class="field-label">Venue</label><input type="text" id="he-venue-${s.id}" value="${escapeHtml(s.venue || "")}"></div>
+        </div>
+        <button class="btn small" id="he-save-${s.id}">Save changes</button>
+        <button class="btn secondary small" id="he-cancel-${s.id}">Cancel</button>
+      </div>`;
+  }
+
+  async function saveHistoryEdit(sessionId) {
+    if (!db) return;
+    const nominatorId = $("#he-nominator-" + sessionId).value;
+    const optionAName = $("#he-optA-name-" + sessionId).value.trim();
+    const optionAUrl = $("#he-optA-url-" + sessionId).value.trim();
+    const optionBName = $("#he-optB-name-" + sessionId).value.trim();
+    const optionBUrl = $("#he-optB-url-" + sessionId).value.trim();
+    const date = $("#he-date-" + sessionId).value;
+    const venue = $("#he-venue-" + sessionId).value.trim();
+    if (!optionAName || !optionBName) { toast("Add both podcast names"); return; }
+    await db.doc("sessions/" + sessionId).update({ nominatorId, optionAName, optionAUrl, optionBName, optionBUrl, date, venue });
+    state.historyEditOpen[sessionId] = false;
+    toast("History updated");
+  }
+
+  function renderBackfill() {
+    const holder = $("#backfill-holder");
+    if (!state.showBackfill) { holder.innerHTML = ""; return; }
+    const roster = activeRoster();
+    holder.innerHTML = `
+      <div class="card" style="margin-bottom:16px;">
+        <p style="margin-top:0;font-size:0.85rem;color:var(--ink-dim);">For meetups that already happened before you started using this — no live reviews, just the record.</p>
+        <label class="field-label">Who nominated</label>
+        <select class="input" id="bf-nominator">
+          <option value="">— select —</option>
+          ${roster.map(id => `<option value="${id}">${escapeHtml(state.members[id].name)}</option>`).join("")}
+        </select>
+        <label class="field-label">Option A</label>
+        <input type="text" id="bf-optA-name" placeholder="Podcast + episode">
+        <input type="url" id="bf-optA-url" placeholder="Link (optional)" style="margin-top:6px;">
+        <label class="field-label">Option B</label>
+        <input type="text" id="bf-optB-name" placeholder="Podcast + episode">
+        <input type="url" id="bf-optB-url" placeholder="Link (optional)" style="margin-top:6px;">
+        <div class="row">
+          <div><label class="field-label">Date</label><input type="date" id="bf-date"></div>
+          <div><label class="field-label">Venue</label><input type="text" id="bf-venue" placeholder="e.g. Surlys, Newcastle"></div>
+        </div>
+        <button class="btn" id="bf-save-btn">Save to history</button>
+        <button class="btn secondary" id="bf-cancel-btn">Cancel</button>
+      </div>
+    `;
+    $("#bf-save-btn").onclick = logPastSession;
+    $("#bf-cancel-btn").onclick = () => { state.showBackfill = false; renderBackfill(); };
+  }
+
+  function renderAll() {
+    renderWhoAmI();
+    renderCarousel();
+    renderUpNext();
+    renderSession();
+    renderRoster();
+    renderHistoryFilter();
+    renderBackfill();
+    renderHistory();
+  }
+
+  // ---------- Actions ----------
+
+  async function addMember() {
+    const input = $("#new-member-name");
+    const names = input.value
+      .split(/[\n,]/)
+      .map(s => s.trim())
+      .filter(Boolean);
+    if (names.length === 0 || !db) return;
+    const rosterDoc = db.doc("meta/roster");
+    const snap = await rosterDoc.get();
+    const order = (snap.exists && snap.data().memberIds) ? snap.data().memberIds.slice() : [];
+    for (const name of names) {
       const ref = await db.collection("members").add({ name, addedAt: Date.now() });
       order.push(ref.id);
     }
